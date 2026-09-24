@@ -292,6 +292,18 @@ def t(
 MAX_BODY_BYTES = 20 * 1024 * 1024  # 20MB limit for non-upload POST bodies
 MAX_CHUNKED_TRAILER_BYTES = 64 * 1024  # cap on the chunked trailer section (RFC 7230 §4.1.2)
 _CHUNK_SIZE_RE = _re.compile(rb'^[0-9a-fA-F]+$')  # chunk-size grammar is hex digits only (RFC 7230 §4.1)
+# Chunked-trailer lines are header field lines (RFC 9112 §7.1.2): a token,
+# colon, optional whitespace, and a field-value of visible/obs-text bytes with
+# optional surrounding OWS. Anything else — notably a bare request line like
+# ``GET /api/... HTTP/1.1`` smuggled past the terminating chunk — is not a
+# field line and must reject, because bytes left unread on a keep-alive
+# connection are parsed as the next request (framing desync).
+_TRAILER_FIELD_LINE_RE = _re.compile(
+    rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+[ \t]*:(?:[ \t]*[\x21-\x7e\x80-\xff][\x21-\xff\x09\x20]*)?[ \t]*$"
+)
+# RFC 9110 §5.6.1 token grammar, as a byte-safe single coding name
+# (tchar = !#$%&'*+\-.^_`|~ DIGIT ALPHA). Lower-cased before matching.
+_TRANSFER_CODING_TOKEN_RE = _re.compile("[!#$%&'*+\\-.^_`|~0-9a-z]+")
 
 
 # ── Credential redaction ──────────────────────────────────────────────────────
@@ -1090,22 +1102,49 @@ def _read_chunked_body(handler, max_bytes: int) -> bytes:
             raise ValueError(f'Malformed chunk size: {size_token!r}')
         size = int(size_token, 16)
         if size == 0:
+            # --- Trailer section (RFC 9112 §7.1.2): trailers are header field
+            # lines. Unvalidated bytes here are parsed as framing, not data,
+            # so a pipelined request line smuggled past the 0-chunk would sit
+            # inside a re-usable connection and silently vanish. Validate every
+            # non-blank trailer as a field line: token ":" OWS value OWS.
+            # Blank lines terminate the section; anything else must match the
+            # field-line grammar or the whole body is rejected and the
+            # connection closed (fail closed, per RFC 9112 §9.5 desync rule).
             terminated = True
             trailer_bytes = 0
+            # A logical trailer line can be larger than one readline(65536)
+            # call returns, so accumulate into a buffer and only judge a line
+            # once its full CRLF framing is on hand (reading half a line and
+            # validating it would falsely reject an intact-but-long field).
+            trailer_buf = b''
             while True:
                 trailer = rfile.readline(65536)
                 trailer_bytes += len(trailer)
                 if trailer_bytes > MAX_CHUNKED_TRAILER_BYTES:
                     handler.close_connection = True
                     raise ValueError(f'Chunked trailers too large (> {MAX_CHUNKED_TRAILER_BYTES} bytes)')
-                if trailer.endswith(b'\n') and not trailer.endswith(b'\r\n'):
-                    handler.close_connection = True
-                    raise ValueError(f'Malformed trailer line: {trailer!r}')
-                if trailer == b'\r\n':
-                    break
                 if not trailer:
                     handler.close_connection = True
                     raise ValueError('Incomplete chunked body: EOF in trailer section')
+                if trailer.endswith(b'\n') and not trailer.endswith(b'\r\n'):
+                    handler.close_connection = True
+                    raise ValueError(f'Malformed trailer line: {trailer!r}')
+                if not trailer.endswith(b'\r\n'):
+                    # Not yet a complete line — keep buffering (bounded by the cap above).
+                    trailer_buf += trailer
+                    continue
+                line = trailer_buf + trailer
+                trailer_buf = b''
+                if line == b'\r\n':
+                    break
+                # Trailers are header field lines (RFC 9112 §7.1.2): anything
+                # else — notably a pipelined request line like
+                # ``GET /api/... HTTP/1.1`` smuggled past the terminating
+                # chunk — would be parsed as the NEXT request's framing on a
+                # keep-alive socket, so reject and close (fail closed).
+                if not _TRAILER_FIELD_LINE_RE.match(line[:-2]):
+                    handler.close_connection = True
+                    raise ValueError(f'Invalid trailer field line: {line!r}')
             break
         if len(out) + size > max_bytes:
             handler.close_connection = True
@@ -1161,15 +1200,28 @@ def read_body(handler) -> dict:
     # present TE header — empty or not — as "TE is in play".
     te_present = len(te_values) > 0
     if te_present:
+        # HTTP OWS is SP and HTAB only (RFC 9110 §5.6.3). Python's str.strip()
+        # would also erase U+00A0 and U+0085 — reachable over the wire because
+        # request lines decode as latin-1 — so padding the coding with a
+        # character the grammar does not allow must be failure, not acceptance:
+        # a stricter intermediary reading \xa0chunked as NON-chunked would
+        # disagree about framing and desync this connection from the network.
         codings = [
-            token.strip().lower()
+            stripped
             for value in te_values
             for token in (value or '').split(',')
-            if token.strip()
+            for stripped in [token.strip(' \t').lower()]
+            if stripped
         ]
         if not codings:
             handler.close_connection = True
             raise ValueError('Invalid Transfer-Encoding header')
+        # RFC 9110 §5.6.1: every transfer coding (including the final one) must
+        # be a bare token. Anything with non-token bytes is not a coding we can
+        # interpret, so reject with the connection closed rather than guess.
+        if any(not _TRANSFER_CODING_TOKEN_RE.fullmatch(coding) for coding in codings):
+            handler.close_connection = True
+            raise ValueError(f'Unsupported Transfer-Encoding codings: {te_values!r}')
         # CL.TE / TE.CL smuggling guard: refuse a request that also carries a
         # Content-Length, and close the connection so no trailing bytes can be
         # replayed as a smuggled second request.
@@ -1183,20 +1235,62 @@ def read_body(handler) -> dict:
             handler.close_connection = True
             raise ValueError(f'Unsupported Transfer-Encoding codings: {te_values!r}')
         raw = _read_chunked_body(handler, MAX_BODY_BYTES)
-        try:
-            return _json.loads(raw)
-        except Exception:
+        # Same validation as the Content-Length branch below: a chunked body
+        # must be a JSON object too, and whitespace-only means empty. Sharing
+        # this path keeps status codes identical across framings (a malformed
+        # chunked JSON body is 400, not an auth 401 or a parse 500) — gate
+        # finding on #6829.
+        if not raw.strip():
             return {}
+        try:
+            parsed = _json.loads(raw)
+        except Exception:
+            raise ValueError('Invalid JSON body') from None
+        if not isinstance(parsed, dict):
+            raise ValueError('JSON body must be an object')
+        return parsed
 
-    raw_length = handler.headers.get('Content-Length', 0)
+    # A request can carry several Content-Length values (repeated lines, or a
+    # comma-combined line — RFC 9110 §5.3 treats the two spellings the same).
+    # Only a DISAGREEING or unreadable set is unframeable: agreeing values keep
+    # a healthy keep-alive. Before any read, reject those and close, because
+    # the bytes the unchosen value declares would corrupt the next request on
+    # this socket (gate finding on #6829).
+    cl_values = []
     try:
-        length = int(raw_length)
-    except (TypeError, ValueError):
+        cl_values = handler.headers.get_all('Content-Length') or []
+    except AttributeError:
+        _cl_single = handler.headers.get('Content-Length')
+        if _cl_single is not None:
+            cl_values = [_cl_single]
+    lengths: set = set()
+    for raw_value in cl_values:
+        for member in (raw_value or '').split(','):
+            stripped = member.strip(' \t')
+            if stripped.isascii() and stripped.isdigit():
+                try:
+                    lengths.add(int(stripped))
+                except ValueError:
+                    lengths = {None}
+                    break
+            else:
+                lengths = {None}
+                break
+        if lengths == {None}:
+            break
+    if lengths == {None}:
         try:
             handler.close_connection = True
         except Exception:
             pass
-        raise ValueError(f'Invalid Content-Length: {raw_length!r}')
+        raise ValueError(f'Invalid Content-Length: {cl_values!r}')
+    if len(lengths) > 1:
+        try:
+            handler.close_connection = True
+        except Exception:
+            pass
+        raise ValueError(f'Conflicting Content-Length values: {cl_values!r}')
+    length = lengths.pop() if lengths else 0
     if length < 0:
         try:
             handler.close_connection = True

@@ -404,6 +404,207 @@ def test_read_body_plain_content_length_still_works_with_real_headers():
     assert handler.close_connection is False
 
 
+def test_read_body_rejects_pipelined_get_smuggled_through_trailer_section():
+    """CORE gate finding: a request body ending at 0-rn followed by a pipelined
+    request line is NOT trailer data — unvalidated bytes after the terminating
+    chunk would be parsed as the NEXT request's framing on a keep-alive socket
+    (the GET silently vanishes and no Connection: close is sent). Every
+    non-blank trailer line must therefore match the field-line grammar."""
+    from api.helpers import read_body
+
+    chunked = b"8\r\n{\"a\": 1}\r\n0\r\nGET /api/auth/status HTTP/1.1\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": "chunked"}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    with pytest.raises(ValueError, match="Invalid trailer field line"):
+        read_body(handler)
+    assert handler.close_connection is True
+
+
+def test_read_body_accepts_valid_trailer_and_serves_body_without_close():
+    """A well-formed trailer (field line then blank line) still parses, with
+    the connection left reusable — the validation only closes on junk."""
+    from api.helpers import read_body
+
+    chunked = b"2\r\n{}\r\n0\r\nX-Marker: abc\r\n\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": "chunked"}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    assert read_body(handler) == {}
+    assert handler.close_connection is False
+
+
+def test_read_body_accepts_trailer_field_without_value():
+    """token ':' with an empty value is a legal RFC 9110 field line — the
+    guard must not over-close a healthy request."""
+    from api.helpers import read_body
+
+    chunked = b"2\r\n{}\r\n0\r\nX-Empty:\r\n\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": "chunked"}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    assert read_body(handler) == {}
+    assert handler.close_connection is False
+
+
+def test_read_body_rejects_non_ows_whitespace_in_transfer_coding():
+    """CORE gate finding: HTTP OWS is SP/HTAB only. Python's default strip()
+    additionally erases U+00A0 and U+0085 (both reachable over the wire since
+    request lines decode as latin-1), so 'Transfer-Encoding: \\xa0chunked' must
+    NOT read back as honest 'chunked' — a stricter intermediary would disagree
+    about framing and desync the connection."""
+    from api.helpers import read_body
+
+    for padded in ("\u00a0chunked", "\u0085chunked"):
+        chunked = b"2\r\n{}\r\n0\r\n\r\n"
+        handler = SimpleNamespace(
+            headers=_real_http_headers([("Transfer-Encoding", padded)]),
+            rfile=io.BytesIO(chunked),
+            close_connection=False,
+        )
+
+        with pytest.raises(ValueError):
+            read_body(handler)
+        assert handler.close_connection is True
+
+
+def test_read_body_accepts_sp_htab_padded_chunked_coding():
+    """Legitimate SP/HTAB padding around the coding stays accepted, so the
+    fix does not over-close well-framed requests from real proxies."""
+    from api.helpers import read_body
+
+    chunked = b"2\r\n{}\r\n0\r\n\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": " \tchunked\t "}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    assert read_body(handler) == {}
+    assert handler.close_connection is False
+
+
+def test_read_body_chunked_malformed_json_returns_validation_error():
+    """SILENT gate finding: the chunked path must share the Content-Length
+    JSON validation — malformed JSON is invalid input (400 after routing),
+    not an empty body that auth then answers 401."""
+    from api.helpers import read_body
+
+    chunked = b"5\r\n{oops\r\n0\r\n\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": "chunked"}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    with pytest.raises(ValueError, match="Invalid JSON body"):
+        read_body(handler)
+
+
+def test_read_body_chunked_non_object_json_returns_validation_error():
+    """Chunked 'null' parses as JSON None, not {{}} — must fail the same
+    isinstance(dict) check the Content-Length path applies (500 → 400)."""
+    from api.helpers import read_body
+
+    chunked = b"4\r\nnull\r\n0\r\n\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": "chunked"}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    with pytest.raises(ValueError, match="JSON body must be an object"):
+        read_body(handler)
+
+
+def test_read_body_chunked_whitespace_only_body_means_empty():
+    """Whitespace-only chunked body is treated as {} like the CL path."""
+    from api.helpers import read_body
+
+    chunked = b"3\r\n \t \r\n0\r\n\r\n"
+    handler = SimpleNamespace(
+        headers=_Headers({"Transfer-Encoding": "chunked"}),
+        rfile=io.BytesIO(chunked),
+        close_connection=False,
+    )
+
+    assert read_body(handler) == {}
+
+
+def test_read_body_rejects_conflicting_duplicate_content_lengths():
+    """Strongly-suggested gate finding: read_body() reading only the FIRST
+    Content-Length lets 'Content-Length: 0' + 'Content-Length: 2' return 200
+    with two payload bytes unread on the socket, corrupting the next pipelined
+    request. Disagreeing values must reject-and-close before any read."""
+    from api.helpers import read_body
+
+    handler = SimpleNamespace(
+        headers=_real_http_headers([("Content-Length", "0"), ("Content-Length", "2")]),
+        rfile=io.BytesIO(b'{"a": 1}'),
+        close_connection=False,
+    )
+
+    with pytest.raises(ValueError, match="Conflicting Content-Length"):
+        read_body(handler)
+    assert handler.close_connection is True
+
+
+def test_read_body_rejects_comma_combined_conflicting_content_lengths():
+    """The same disagreement spelled as one comma-combined line is rejected too
+    (RFC 9110 §5.3 treats the two list spellings identically)."""
+    from api.helpers import read_body
+
+    handler = SimpleNamespace(
+        headers=_real_http_headers([("Content-Length", "0, 2")]),
+        rfile=io.BytesIO(b'{"a": 1}'),
+        close_connection=False,
+    )
+
+    with pytest.raises(ValueError, match="Conflicting Content-Length"):
+        read_body(handler)
+    assert handler.close_connection is True
+
+
+def test_read_body_accepts_agreeing_duplicate_content_lengths():
+    """Duplicated but AGREEING Content-Length values are one declared length —
+    keep-alive must stay healthy (do not over-close)."""
+    from api.helpers import read_body
+
+    handler = SimpleNamespace(
+        headers=_real_http_headers([("Content-Length", "8"), ("Content-Length", "8")]),
+        rfile=io.BytesIO(b'{"a": 1}'),
+        close_connection=False,
+    )
+
+    assert read_body(handler) == {"a": 1}
+    assert handler.close_connection is False
+
+
+def test_read_body_rejects_unreadable_content_length():
+    """'banana' (or a blank value) declares a body whose size no header states,
+    so bytes may still be queued: reject and close, don't treat as 0."""
+    from api.helpers import read_body
+
+    handler = SimpleNamespace(
+        headers=_real_http_headers([("Content-Length", "banana")]),
+        rfile=io.BytesIO(b'{"a": 1}'),
+        close_connection=False,
+    )
+
+    with pytest.raises(ValueError, match="Invalid Content-Length"):
+        read_body(handler)
+    assert handler.close_connection is True
+
+
 def test_session_save_rejects_unsafe_session_id(tmp_path, monkeypatch):
     import api.models as models
 
