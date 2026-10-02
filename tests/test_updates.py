@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -797,6 +799,69 @@ def test_run_git_returns_exit_code_when_no_output(tmp_path):
 
     assert ok is False
     assert 'status 1' in out
+
+
+def test_run_git_never_launches_an_interactive_credential_prompt(tmp_path, monkeypatch):
+    """A background update check must not be able to open a credential prompt.
+
+    Reported symptom: the WebUI was checking for updates from a desktop session,
+    so the git child inherited ``SSH_ASKPASS=/usr/bin/ksshaskpass`` and
+    ``DISPLAY``. Its ``git fetch`` reached an origin that answered 401, git fell
+    back to the inherited askpass helper, and a modal "Enter SSH Credentials"
+    window appeared on the user's desktop while the check blocked.
+
+    Bind the test to that scene: serve a 401 the way an HTTPS remote does,
+    install an askpass helper that records being run, and assert the helper is
+    never executed. The fetch itself must fail closed instead of prompting.
+    """
+    marker = tmp_path / 'askpass-was-invoked'
+    helper = tmp_path / 'askpass-helper.sh'
+    helper.write_text(
+        f'#!/bin/sh\ntouch "{marker}"\necho placeholder-credential\n', encoding='utf-8'
+    )
+    helper.chmod(0o755)
+    # The environment a desktop WebUI session hands to its children.
+    monkeypatch.setenv('GIT_ASKPASS', str(helper))
+    monkeypatch.setenv('SSH_ASKPASS', str(helper))
+    monkeypatch.setenv('SSH_ASKPASS_REQUIRE', 'prefer')
+    monkeypatch.setenv('DISPLAY', ':0')
+    monkeypatch.delenv('GIT_TERMINAL_PROMPT', raising=False)
+
+    requests_seen = []
+
+    class _AuthRequiredHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib handler naming
+            requests_seen.append(self.path)
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="git"')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), _AuthRequiredHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _git(repo, 'init', '-q')
+        _git(
+            repo, 'remote', 'add', 'origin',
+            f'http://127.0.0.1:{server.server_address[1]}/origin.git',
+        )
+        out, ok = updates._run_git(['fetch', 'origin'], repo, timeout=30)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert requests_seen, (
+        'the fetch never reached the 401 remote, so this test proves nothing'
+    )
+    assert not marker.exists(), (
+        f'the update check launched an interactive credential helper: {out!r}'
+    )
+    assert ok is False, out
 
 
 def test_run_git_uses_utf8_replacement_for_windows_console_output(tmp_path):
@@ -2205,3 +2270,59 @@ def test_check_for_updates_aggregate_timeout_never_exceeds_budget(tmp_path, monk
     assert result['agent'] is not None
     assert 'error' in result['agent']
     assert 'timed out' in result['agent']['error']
+
+
+def test_update_fetch_timeout_env_default_and_clamp(monkeypatch):
+    """The update-check fetch bound is operator-tunable and clamped (PR #6830).
+
+    Mirrors the HERMES_WEBUI_MAX_REQUEST_WORKERS contract: conservative
+    default, bounded override, unparseable value falls back to the default.
+    """
+    monkeypatch.delenv(updates._UPDATE_FETCH_TIMEOUT_ENV, raising=False)
+    assert updates._update_fetch_timeout_s() == updates._UPDATE_FETCH_TIMEOUT_DEFAULT_S
+
+    monkeypatch.setenv(updates._UPDATE_FETCH_TIMEOUT_ENV, '120')
+    assert updates._update_fetch_timeout_s() == 120
+
+    monkeypatch.setenv(updates._UPDATE_FETCH_TIMEOUT_ENV, '1')
+    assert updates._update_fetch_timeout_s() == updates._UPDATE_FETCH_TIMEOUT_MIN_S
+
+    monkeypatch.setenv(updates._UPDATE_FETCH_TIMEOUT_ENV, '99999')
+    assert updates._update_fetch_timeout_s() == updates._UPDATE_FETCH_TIMEOUT_MAX_S
+
+    monkeypatch.setenv(updates._UPDATE_FETCH_TIMEOUT_ENV, 'not-a-number')
+    assert updates._update_fetch_timeout_s() == updates._UPDATE_FETCH_TIMEOUT_DEFAULT_S
+
+
+def test_update_budget_exceeds_fetch_bound():
+    """The aggregate budget must cover the configured fetch bound.
+
+    A fixed 45s budget would re-hide updates behind a smaller window once the
+    fetch bound is raised, which is the failure the field reports on this PR
+    flagged at 57s / 91.55s / 113s of observed fetch latency.
+    """
+    assert updates._UPDATE_CHECK_BUDGET_S >= 45
+    assert updates._UPDATE_CHECK_BUDGET_S >= updates._UPDATE_FETCH_TIMEOUT_S + 15
+
+
+def test_check_repo_fetch_uses_configured_timeout(tmp_path, monkeypatch):
+    """_check_repo must pass the configured bound, not a hard-coded value."""
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+    seen = {}
+
+    def fake_run_git(args, cwd, timeout=10):
+        if list(args[:1]) == ['fetch']:
+            seen['timeout'] = timeout
+        return '', False  # fetch fails -> offline path, no tag probing
+
+    monkeypatch.setattr(updates, '_run_git', fake_run_git)
+    monkeypatch.setattr(updates, '_check_repo_release', lambda *a, **k: None)
+    monkeypatch.setattr(updates, '_is_dirty', lambda *a, **k: False)
+    monkeypatch.setattr(updates, '_UPDATE_FETCH_TIMEOUT_S', 137)
+
+    result = updates._check_repo(repo, 'webui', 'stable')
+
+    assert result is not None
+    assert seen.get('timeout') == 137
+    assert result['stale_check'] is True

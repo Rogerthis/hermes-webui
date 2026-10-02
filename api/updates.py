@@ -28,6 +28,15 @@ from api.agent_health import get_active_profile_gateway_running_pid
 from api.gateway_restart import restart_active_profile_gateway
 from api.profiles import get_active_profile_name
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
+from api.subprocess_utils import (
+    clean_git_env,
+    noninteractive_git_env,
+    noninteractive_git_argv,
+    repository_git_proxy_blocks,
+    sanitize_git_diagnostic,
+    trusted_git_credential_config,
+    windows_hide_flags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +62,51 @@ _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same re
 CACHE_TTL = 1800  # 30 minutes
 _AGENT_GATEWAY_RESTART_RETRY_DELAY_S = 1.0
 _FORCE_DIRTY_PROBE_TIMEOUT = 5
-_UPDATE_CHECK_BUDGET_S = 45  # bounded overall budget for concurrent update checks (PR #6830)
+# Update-check fetch bound and aggregate budget (PR #6830).
+#
+# `git fetch origin --tags --force` latency is remote-side, and on slow or
+# loaded hosts it routinely exceeds the old 15s cap: field reports on this PR
+# measured 57s, 91.55s and 113s against the Agent checkout, whose remote
+# advertises ~134k refs against ~9k for the WebUI remote. A fixed bound only
+# relocates the "hides an available update" failure to a different threshold,
+# so the bound is operator-tunable via env - the same shape as
+# HERMES_WEBUI_MAX_REQUEST_WORKERS in server.py. Read at import time, so a
+# change needs a restart.
+_UPDATE_FETCH_TIMEOUT_DEFAULT_S = 30
+_UPDATE_FETCH_TIMEOUT_MIN_S = 5
+_UPDATE_FETCH_TIMEOUT_MAX_S = 240
+_UPDATE_FETCH_TIMEOUT_ENV = 'HERMES_WEBUI_UPDATE_FETCH_TIMEOUT_S'
+
+
+def _update_fetch_timeout_s() -> int:
+    """Return the operator-configured update-check fetch timeout, clamped.
+
+    An absent value keeps the default. An unparseable value also falls back to
+    the default with a warning, so a typo can never yield a zero-second or
+    unbounded fetch.
+    """
+    raw = os.environ.get(_UPDATE_FETCH_TIMEOUT_ENV, '').strip()
+    if not raw:
+        return _UPDATE_FETCH_TIMEOUT_DEFAULT_S
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            '%s=%r is not an integer; using default %ss',
+            _UPDATE_FETCH_TIMEOUT_ENV, raw, _UPDATE_FETCH_TIMEOUT_DEFAULT_S,
+        )
+        return _UPDATE_FETCH_TIMEOUT_DEFAULT_S
+    return max(_UPDATE_FETCH_TIMEOUT_MIN_S, min(_UPDATE_FETCH_TIMEOUT_MAX_S, value))
+
+
+_UPDATE_FETCH_TIMEOUT_S = _update_fetch_timeout_s()
+# The aggregate budget must cover the per-repo fetch bound plus headroom for the
+# git probes that follow a successful fetch (release/tag, branch, dirty). Kept
+# derived so an operator who raises the fetch timeout cannot silently re-hide
+# updates behind a smaller budget - the exact failure the field reports flagged.
+_UPDATE_CHECK_BUDGET_S = max(45, _UPDATE_FETCH_TIMEOUT_S + 15)
 _GIT_DIAGNOSTIC_MAX_CHARS = 300
-_CREDENTIAL_IN_URL_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s'\"]+)@")
-_GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
-_QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|oauth_token|private_token|client_secret|app_secret|api[_-]?key|token|password|secret|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
+
 _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'could not resolve host',
     'failed to connect',
@@ -83,6 +132,29 @@ _GIT_LOCK_SIGNATURES = (
     'another git process seems to be running',
     'unable to create .git/index.lock',
 )
+
+
+def _windows_restart_spawn(args, **kwargs):
+    """Spawn the replacement process for a Windows self-restart."""
+    return subprocess.Popen(args, **kwargs)
+
+
+def _windows_restart_exit(code):
+    """Exit the old process after a Windows replacement is running."""
+    os._exit(code)
+
+
+def _windows_restart_command():
+    """Return the canonical replacement command for the current packaging mode."""
+    if getattr(sys, "frozen", False):
+        return list(sys.argv)
+
+    executable = sys.executable
+    if executable.lower().endswith("python.exe"):
+        windowless_executable = executable[:-4] + "w.exe"
+        if os.path.isfile(windowless_executable):
+            executable = windowless_executable
+    return [executable, str(REPO_ROOT / "server.py")]
 # Lock files we previously enumerated for auto-removal in v2. v2.2 no longer
 # removes anything on the server, so the enumerable list is no longer needed;
 # ``_inventory_locks`` reports whatever ``.git/**/*.lock`` files currently exist
@@ -97,15 +169,7 @@ def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CH
     but strip URL userinfo, common GitHub token shapes, and secret-looking query
     parameter values before any message reaches the update-check API/UI.
     """
-    if not output:
-        return ""
-    sanitized = _CREDENTIAL_IN_URL_RE.sub(r"\1<redacted>@", str(output))
-    sanitized = _GITHUB_TOKEN_RE.sub("<redacted>", sanitized)
-    sanitized = _QUERY_SECRET_RE.sub(r"\1<redacted>", sanitized)
-    sanitized = sanitized.strip()
-    if len(sanitized) > limit:
-        sanitized = sanitized[:limit].rstrip() + "…"
-    return sanitized
+    return sanitize_git_diagnostic(output, limit=limit)
 
 
 def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:
@@ -217,15 +281,42 @@ def _run_git(args, cwd, timeout=10):
 
     On failure, returns stderr (or stdout as fallback) so callers can
     surface actionable git error messages instead of empty strings.
+
+    The child gets a scrubbed environment (``clean_git_env``). Update checks run
+    unattended, so inherited desktop askpass helpers must not turn a remote 401
+    into a credential dialog the user never asked for. Credential helpers from
+    system and user config remain available; checkout config cannot add one.
     """
     git_executable = _resolve_git_executable()
     if not git_executable:
         return 'git executable not found', False
+    env = clean_git_env()
+    if repository_git_proxy_blocks(args, cwd, env, executable=git_executable):
+        return 'repository-configured core.gitProxy is not allowed for git:// update remotes', False
+    is_network_command = bool(args and args[0] in {'fetch', 'pull', 'push', 'ls-remote'})
+    credential_config = ()
+    if is_network_command:
+        credential_config = trusted_git_credential_config(
+            cwd,
+            env,
+            executable=git_executable,
+        )
+        env = noninteractive_git_env(cwd, env, executable=git_executable, args=args)
     try:
         r = subprocess.run(
-            [git_executable] + args, cwd=str(cwd), capture_output=True,
-            text=True, timeout=timeout,
-            encoding='utf-8', errors='replace',
+            noninteractive_git_argv(
+                args,
+                executable=git_executable,
+                credential_config=credential_config,
+            ) if is_network_command else [git_executable] + args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding='utf-8',
+            errors='replace',
+            env=env,
+            creationflags=windows_hide_flags(),
         )
         # On non-UTF-8 locales (e.g. Chinese Windows GBK), a binary git
         # output that fails to decode used to leave r.stdout = None and crash
@@ -1215,7 +1306,8 @@ def _repo_check_lock(path: Path) -> threading.Lock:
     """Return the per-repo lock serializing git operations on ``path``.
 
     After a timed-out check, ``executor.shutdown(wait=False)`` leaves the
-    straggler worker running (bounded by the 30s fetch timeout). Without
+    straggler worker running (bounded by the update-check fetch timeout,
+    ``_UPDATE_FETCH_TIMEOUT_S``). Without
     this lock a new forced check could run git concurrently on the same
     checkout — index.lock failures, or update results computed from refs
     that changed mid-read. (PR #6830, Greptile: detached checks overlap
@@ -1258,11 +1350,11 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
         }
 
     # Serialize git operations on this checkout. A straggler from a
-    # timed-out check may still be fetching (bounded by the 30s fetch
-    # timeout); a new forced check must not run git concurrently on the
-    # same repo — index.lock failures, or results computed from refs that
-    # changed mid-read. (PR #6830, Greptile: detached checks overlap later
-    # fetches)
+    # timed-out check may still be fetching (bounded by the configured
+    # update-check fetch timeout); a new forced check must not run git
+    # concurrently on the same repo — index.lock failures, or results
+    # computed from refs that changed mid-read. (PR #6830, Greptile:
+    # detached checks overlap later fetches)
     with _repo_check_lock(path):
         # Fetch tags first so update prompts track published releases, not every
         # development commit that lands on master/main after the latest release.
@@ -1273,7 +1365,7 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
         # after a squash-merge that re-points a release tag at a new SHA) jams
         # the update path indefinitely with "would clobber existing tag" errors.
         # See #2756.
-        fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--tags', '--force'], path, timeout=30)
+        fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--tags', '--force'], path, timeout=_UPDATE_FETCH_TIMEOUT_S)
         if not fetch_ok:
             release_info = _check_repo_release(path, name, channel)
             message = 'fetch failed'
@@ -1396,9 +1488,10 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
     try:
         # Run checks concurrently with a bounded overall timeout to prevent
         # slow network I/O from blocking the response. Each _check_repo call
-        # can take up to 30s (git fetch timeout), so the serial path could
-        # take up to 60s. We cap the aggregate at 45s and return partial
-        # results if one check times out. (PR #6830)
+        # can block for the whole update-check fetch timeout, so the serial
+        # path could take twice that. _UPDATE_CHECK_BUDGET_S is derived to
+        # exceed the fetch bound, and we return partial results if one check
+        # times out. (PR #6830)
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
         webui_info = None
@@ -1820,9 +1913,9 @@ def _schedule_restart(delay: float = 2.0) -> None:
     loaded on the next request, rather than running with a mix of old and
     new Python modules in sys.modules.
 
-    os.execv() replaces the current process image with a fresh interpreter
-    running the same argv — sessions are preserved on disk, the HTTP port
-    is reclaimed within the delay window, and the client's own
+    The restart replaces the current process image or starts the canonical
+    server entrypoint, depending on platform and packaging mode. Sessions are
+    preserved on disk, the HTTP port is reclaimed within the delay window, and the client's own
     ``setTimeout(() => location.reload(), 2500)`` lands after the restart.
 
     Coordinates with ``_apply_lock``: when the user updates both webui
@@ -1860,84 +1953,47 @@ def _schedule_restart(delay: float = 2.0) -> None:
             try:
                 # Re-exec into the just-pulled image.
                 #
-                # sys.argv[0]'s meaning depends on how the server was launched:
-                #
-                #   * Source checkout (`python server.py` via bootstrap.py /
-                #     ctl.sh / start.sh): sys.argv[0] is the SCRIPT path
-                #     (e.g. "/root/hermes-webui/server.py"), sys.executable is
-                #     the interpreter. CPython treats argv[1] as the script to
-                #     run, so we must pass [sys.executable] + sys.argv.
-                #
-                #   * Frozen/packaged build (PyInstaller, embedded zipapp,
-                #     etc.): sys.argv[0] == sys.executable == <binary>. Passing
-                #     [sys.executable] + sys.argv would re-insert the binary as
-                #     argv[1] — the kernel launches it, the interpreter treats
-                #     the binary itself as the "script" to run, and execv
-                #     effectively becomes a recursive no-op that never reaches
-                #     bind(), leaving the WebUI stuck "offline" after every
-                #     self-update. Pass argv as-is instead.
-                #
-                # Distinguish the two cases with sys.frozen (set by
-                # PyInstaller / zipapp / similar). For source checkouts the
-                # `[sys.executable] + sys.argv` form is the canonical CPython
-                # re-exec idiom (same shape Flask/Django reloaders use) and
-                # is the correct path.
-                #
                 # IMPORTANT: On Windows, os.execv() does NOT replace the
                 # current process — it spawns a new process while the old
                 # one keeps running.  This causes "address already in use"
                 # because the old process still holds the port.  On Windows
-                # we use subprocess.Popen() + os._exit() instead.
+                # we use a detached spawn + exit instead.
                 if sys.platform == 'win32':
-                    import subprocess
-                    if getattr(sys, "frozen", False):
-                        args = sys.argv
-                    else:
-                        args = [sys.executable] + sys.argv
-                    # Prefer pythonw.exe over python.exe so the restarted
-                    # server does not create a visible console window.
-                    # sys.executable may point at python.exe (console
-                    # subsystem); substitute pythonw.exe if it exists
-                    # next to python.exe.
-                    _exe = sys.executable
-                    if _exe.lower().endswith('python.exe'):
-                        _w_exe = _exe[:-4] + 'w.exe'  # python.exe -> pythonw.exe
-                        if os.path.isfile(_w_exe):
-                            if getattr(sys, "frozen", False):
-                                args = sys.argv
-                            else:
-                                args = [_w_exe] + sys.argv
+                    args = _windows_restart_command()
                     # Start new process fully detached with NO console
                     # window.  DETACHED_PROCESS alone is not sufficient
                     # on modern Windows — without CREATE_NO_WINDOW a
                     # python.exe (console-subsystem) child still flashes
                     # an empty terminal window, which the user then
                     # manually kills (taking the WebUI with it).
-                    subprocess.Popen(
-                        args,
-                        cwd=os.getcwd(),
-                        creationflags=(
-                            subprocess.DETACHED_PROCESS
-                            | subprocess.CREATE_NEW_PROCESS_GROUP
-                            | subprocess.CREATE_NO_WINDOW
-                        ),
-                        close_fds=True,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+                    try:
+                        _windows_restart_spawn(
+                            args,
+                            cwd=os.getcwd(),
+                            creationflags=(
+                                subprocess.DETACHED_PROCESS
+                                | subprocess.CREATE_NEW_PROCESS_GROUP
+                                | subprocess.CREATE_NO_WINDOW
+                            ),
+                            close_fds=True,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        logger.exception("Windows WebUI restart spawn failed")
+                        return
                     # Exit immediately — the port is released as soon as
                     # this process dies, allowing the new process to bind.
-                    os._exit(0)
+                    _windows_restart_exit(0)
                 else:
                     if getattr(sys, "frozen", False):
                         os.execv(sys.executable, sys.argv)
                     else:
                         os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
-                # Last-resort: if execv fails for any reason, just exit so the
-                # process supervisor (start.sh / Docker) restarts us.
-                os._exit(0)
+                # Last-resort: let the process supervisor restart us.
+                _windows_restart_exit(0)
 
     threading.Thread(target=_do, daemon=True).start()
 
@@ -2527,11 +2583,8 @@ def _apply_update_locked(target, channel, path):
             }
 
     # Schedule a self-restart so the updated code is loaded fresh.  A plain
-    # git pull leaves stale Python modules in sys.modules — agent imports that
-    # reference new symbols (functions, classes) added in the update will fail
-    # on the next request with AttributeError / ImportError.  os.execv() re-
-    # execs the same interpreter with the same argv, picking up the new code
-    # cleanly without requiring the user to restart manually.
+    # git pull leaves stale Python modules in sys.modules. Replacing the process
+    # loads the updated code cleanly without requiring a manual restart.
     #
     # The 2 s delay gives the HTTP response time to flush to the client before
     # the process replaces itself.  The client already does
